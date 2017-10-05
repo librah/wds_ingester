@@ -1,0 +1,2 @@
+watson-developer-cloud~=0.26.1
+pika~=0.11.0
