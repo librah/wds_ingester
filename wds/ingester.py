@@ -2,10 +2,14 @@ import argparse
 import codecs
 import json
 import logging
+import multiprocessing
 import os
-from StringIO import StringIO
 import sys
+import thread
 import time
+from Queue import PriorityQueue
+from StringIO import StringIO
+from threading import Thread
 
 from watson_developer_cloud import DiscoveryV1
 
@@ -22,14 +26,20 @@ except ImportError:
 logger = logging.getLogger('ingester')
 
 #
-# Evil global variables used in this code
+# The threads in this code
 #
-ingest_input = None  # where to get the document for ingestion
-ingest_output = None  # where to store the ingestion result
+thread_pool = []  # all the threads (including producer & consumer) run in this code
+
+# Infinite queue to store the file change events (priority high to low)
+#  - 0: poison pill (for stopping threads)
+#  - 1: documents to be updated/deleted
+request_queue = PriorityQueue(1000)
+CONST_Q_PRIORITY_POISON = 0
+CONST_Q_PRIORITY_UPDATE = 1
 
 
 class WDSIngester:
-    def __init__(self, user, password, env_id, collection_id, version):
+    def __init__(self, user, password, env_id, collection_id, version, processing_cap=10):
         discovery_option = {
             'username': user,
             'password': password
@@ -38,19 +48,45 @@ class WDSIngester:
         self.env_id = env_id
         self.collection_id = collection_id
         self.version = version
+        self.processing_cap = processing_cap
+        if self.processing_cap <= 0:
+            self.processing_cap = 10
 
         collection = self.discovery.get_collection(self.env_id, self.collection_id)
-        logger.info('Creating WDSIngester to WDS collection: %s (%s)', collection['name'], collection['collection_id'])
+        logger.info('Creating WDSIngester to WDS collection: %s (%s, cap: %d)', collection['name'], collection['collection_id'], self.processing_cap)
 
-    def update_document(self, doc_id, doc):
-        io = StringIO()
-        json.dump(doc, io)
-        io.seek(0)
-        logger.info('Ingesting document %s', doc_id)
-        wds_result = self.discovery.update_document(self.env_id, self.collection_id, doc_id, file_data=io, mime_type='application/json')
-        logger.info('WDS response: %s', wds_result)
-        assert 'processing' in wds_result['status']
-        return wds_result
+    def update_document(self, doc_id, file_name, doc):
+        # wait till the processing document count is smaller than the capped size
+        retry = 300
+        delay = 1
+        while True:
+            retry -= 1
+            if retry == 0:
+                logger.error('Failed to ingest after retries: %s', doc_id)
+                return
+            try:
+                wds_result = self.discovery.get_collection(self.env_id, self.collection_id)
+                if wds_result['document_counts']['processing'] < self.processing_cap:
+                    break
+                else:
+                    time.sleep(delay)
+            except:
+                logger.exception('Unexpected exception when ingesting %s', doc_id)
+                logger.error('Failed to ingest: %s', doc_id)
+                return
+
+        try:
+            io = StringIO()
+            json.dump(doc, io)
+            io.seek(0)
+            logger.info('Ingesting document %s', doc_id)
+            wds_result = self.discovery.update_document(self.env_id, self.collection_id, doc_id, file=io, file_content_type='application/json', filename=file_name)
+            logger.info('WDS response: %s', wds_result)
+            assert 'processing' in wds_result['status']
+            return wds_result
+        except:
+            logger.exception('Unexpected exception when ingesting %s', doc_id)
+            logger.error('Failed to ingest: %s', doc_id)
 
     def delete_document(self, doc_id):
         logger.info('Deleting document %s', doc_id)
@@ -107,42 +143,102 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Ingest files to Watson Discovery Service (WDS)')
 
     parser.add_argument('--input', required=True, help='The input channel, file://directory, others')
-    parser.add_argument('--d', required=False, default=False, action='store_true', help='Run in background. Default No')
     parser.add_argument('--output', required=False, help='Pull WDS enriched result to the output')
+    parser.add_argument('--wds_cap', required=False, type=int, default=0,
+                        help='The max WDS processing document counts.')  # when hit this, wait until process count reduce
+    parser.add_argument('--concurrency', required=False, type=int, default=multiprocessing.cpu_count() * 2,
+                        help='How many concurrent threads. Default to 2 x number of CPUs')
 
-    args = parser.parse_args()
-
-    global ingest_input
-    ingest_input = os.path.abspath(os.path.expanduser(args.input))
-
-    global ingest_output
-    ingest_output = os.path.abspath(os.path.expanduser(args.output))
+    return parser.parse_args()
 
 
-def main():
+def consumer(ingest_output=None, wds_cap=None):
+    """
+    The consumer reads file change event from the task queue, and then do its work
+    :return: None
+    """
+    logger.info('consumer %d started', thread.get_ident())
     wds_ingester = WDSIngester(os.getenv('WDS_USER'),
                                os.getenv('WDS_PASSWD'),
                                os.getenv('WDS_ENV_ID'),
                                os.getenv('WDS_COLLECTION_ID'),
-                               os.getenv('WDS_VERSION'))
-    for entry in scan_left_over_files(ingest_input):
+                               os.getenv('WDS_VERSION'),
+                               processing_cap=wds_cap)
+    try:
+        while True:
+            priority, file_path = request_queue.get()
+
+            if priority == CONST_Q_PRIORITY_POISON or file_path is None:
+                logger.info('consumer %d gets POISON pills and is stopping' % thread.get_ident())
+                break
+            else:
+                with open(file_path, 'r') as f:
+                    document_id = os.path.splitext(os.path.basename(file_path))[0]  # only keep the file_name w/o ext
+                    file_content = f.read().decode('utf-8-sig')
+                    if len(file_content.strip()) == 0:
+                        wds_ingester.delete_document(document_id)
+                        if ingest_output:
+                            #  TODO - delete document from the output directory
+                            pass
+                    else:
+                        document = json.loads(file_content)
+                        wds_ingester.update_document(document_id, os.path.basename(file_path), document)
+                        if ingest_output:
+                            enriched_document = wds_ingester.get_document(document_id)
+                            output_filename = os.path.join(ingest_output, os.path.basename(file_path))
+                            logger.info('Writing %s', output_filename)
+                            with codecs.open(output_filename, mode='w', encoding='utf-8') as f:
+                                f.write(json.dumps(enriched_document, ensure_ascii=False, indent=2))
+
+                request_queue.task_done()
+    except:
+        # catch and log unexpected exception, so error handling can be enhanced gradually
+        logger.exception('consumer %d exited due to unexpected exception' % thread.get_ident())
+
+
+def main():
+    args = parse_args()
+
+    if args.concurrency > 1:
+        kwarg = {
+            "ingest_output": None,
+            "wds_cap": args.wds_cap
+        }
+        for i in range(args.concurrency):
+            t = Thread(target=consumer, kwargs=kwarg)
+            t.start()
+            thread_pool.append(t)
+    else:
+        wds_ingester = WDSIngester(os.getenv('WDS_USER'),
+                                   os.getenv('WDS_PASSWD'),
+                                   os.getenv('WDS_ENV_ID'),
+                                   os.getenv('WDS_COLLECTION_ID'),
+                                   os.getenv('WDS_VERSION'))
+
+    for entry in scan_left_over_files(args.input):
         if entry.is_file():
             try:
                 file_path = entry.path
-                with open(file_path, 'r') as f:
-                    document = json.loads(f.read().decode('utf-8-sig'))
-                    document_id = document['id']
-
-                wds_ingester.update_document(document_id, document)
-
-                if ingest_output:
-                    enriched_document = wds_ingester.get_document(document_id)
-                    output_filename = os.path.join(ingest_output, os.path.basename(file_path))
-                    logger.info('Writing %s', output_filename)
-                    with codecs.open(output_filename, mode='w', encoding='utf-8') as f:
-                        f.write(json.dumps(enriched_document, ensure_ascii=False, indent=2))
+                if args.concurrency > 1:
+                    request_queue.put((CONST_Q_PRIORITY_UPDATE, file_path))
+                else:
+                    with open(file_path, 'r') as f:
+                        document_id = os.path.splitext(os.path.basename(file_path))[0]  # only keep the file_name w/o ext
+                        file_content = f.read().decode('utf-8-sig')
+                        if len(file_content.strip()) == 0:
+                            wds_ingester.delete_document(document_id)
+                        else:
+                            document = json.loads(file_content)
+                            wds_ingester.update_document(document_id, os.path.basename(file_path), document)
             except:
                 logger.exception('Error when processing %s' % entry)
+
+    if args.concurrency > 1:
+        for i in range(args.concurrency):
+            request_queue.put((CONST_Q_PRIORITY_UPDATE, None))
+
+        for i in range(args.concurrency):
+            thread_pool[i].join()
 
 
 #
@@ -158,8 +254,6 @@ if __name__ == '__main__':
         if required_env not in os.environ:
             print 'Missing required env variable "%s"' % required_env
             sys.exit(-1)
-
-    parse_args()
 
     main()
 
