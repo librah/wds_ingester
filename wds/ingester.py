@@ -5,13 +5,13 @@ import logging
 import multiprocessing
 import os
 import sys
-import thread
 import time
-from Queue import PriorityQueue
-from StringIO import StringIO
+from queue import PriorityQueue
+from io import StringIO
 from threading import Thread
+import threading
 
-from watson_developer_cloud import DiscoveryV1
+from ibm_watson import DiscoveryV1
 
 # Use the built-in version of scandir/walk if possible, otherwise
 # use the scandir module version
@@ -52,7 +52,7 @@ class WDSIngester:
         if self.processing_cap <= 0:
             self.processing_cap = 10
 
-        collection = self.discovery.get_collection(self.env_id, self.collection_id)
+        collection = self.discovery.get_collection(self.env_id, self.collection_id).get_result()
         logger.info('Creating WDSIngester to WDS collection: %s (%s, cap: %d)', collection['name'], collection['collection_id'], self.processing_cap)
 
     def update_document(self, doc_id, file_name, doc):
@@ -65,7 +65,7 @@ class WDSIngester:
                 logger.error('Failed to ingest after retries: %s', doc_id)
                 return
             try:
-                wds_result = self.discovery.get_collection(self.env_id, self.collection_id)
+                wds_result = self.discovery.get_collection(self.env_id, self.collection_id).get_result()
                 if wds_result['document_counts']['processing'] < self.processing_cap:
                     break
                 else:
@@ -80,7 +80,7 @@ class WDSIngester:
             json.dump(doc, io)
             io.seek(0)
             logger.info('Ingesting document %s', doc_id)
-            wds_result = self.discovery.update_document(self.env_id, self.collection_id, doc_id, file=io, file_content_type='application/json', filename=file_name)
+            wds_result = self.discovery.update_document(self.env_id, self.collection_id, doc_id, file=io, file_content_type='application/json', filename=file_name).get_result()
             logger.info('WDS response: %s', wds_result)
             assert 'processing' in wds_result['status']
             return wds_result
@@ -103,7 +103,7 @@ class WDSIngester:
         """
         logger.info('Getting document %s', doc_id)
         while True:
-            wds_result = self.discovery.get_document(self.env_id, self.collection_id, doc_id)
+            wds_result = self.discovery.get_document_status(self.env_id, self.collection_id, doc_id).get_result()
             logger.info('WDS response: %s', wds_result)
             if 'available' in wds_result['status']:
                 # pull the document
@@ -146,7 +146,7 @@ def parse_args():
     parser.add_argument('--output', required=False, help='Pull WDS enriched result to the output')
     parser.add_argument('--wds_cap', required=False, type=int, default=0,
                         help='The max WDS processing document counts.')  # when hit this, wait until process count reduce
-    parser.add_argument('--concurrency', required=False, type=int, default=multiprocessing.cpu_count() * 2,
+    parser.add_argument('--concurrency', required=False, type=int, default=multiprocessing.cpu_count(),
                         help='How many concurrent threads. Default to 2 x number of CPUs')
 
     return parser.parse_args()
@@ -157,7 +157,7 @@ def consumer(ingest_output=None, wds_cap=None):
     The consumer reads file change event from the task queue, and then do its work
     :return: None
     """
-    logger.info('consumer %d started', thread.get_ident())
+    logger.info('consumer %d started', threading.get_ident())
     wds_ingester = WDSIngester(os.getenv('WDS_USER'),
                                os.getenv('WDS_PASSWD'),
                                os.getenv('WDS_ENV_ID'),
@@ -169,12 +169,12 @@ def consumer(ingest_output=None, wds_cap=None):
             priority, file_path = request_queue.get()
 
             if priority == CONST_Q_PRIORITY_POISON or file_path is None:
-                logger.info('consumer %d gets POISON pills and is stopping' % thread.get_ident())
+                logger.info('consumer %d gets POISON pills and is stopping' % threading.get_ident())
                 break
             else:
-                with open(file_path, 'r') as f:
+                with codecs.open(file_path, 'r', 'utf-8') as f:
                     document_id = os.path.splitext(os.path.basename(file_path))[0]  # only keep the file_name w/o ext
-                    file_content = f.read().decode('utf-8-sig')
+                    file_content = f.read()
                     if len(file_content.strip()) == 0:
                         wds_ingester.delete_document(document_id)
                         if ingest_output:
@@ -193,7 +193,7 @@ def consumer(ingest_output=None, wds_cap=None):
                 request_queue.task_done()
     except:
         # catch and log unexpected exception, so error handling can be enhanced gradually
-        logger.exception('consumer %d exited due to unexpected exception' % thread.get_ident())
+        logger.exception('consumer %d exited due to unexpected exception' % threading.get_ident())
 
 
 def main():
@@ -222,9 +222,9 @@ def main():
                 if args.concurrency > 1:
                     request_queue.put((CONST_Q_PRIORITY_UPDATE, file_path))
                 else:
-                    with open(file_path, 'r') as f:
+                    with codecs.open(file_path, 'r', 'utf-8') as f:
                         document_id = os.path.splitext(os.path.basename(file_path))[0]  # only keep the file_name w/o ext
-                        file_content = f.read().decode('utf-8-sig')
+                        file_content = f.read()
                         if len(file_content.strip()) == 0:
                             wds_ingester.delete_document(document_id)
                         else:
@@ -252,7 +252,7 @@ if __name__ == '__main__':
     #
     for required_env in ('WDS_USER', 'WDS_PASSWD', 'WDS_COLLECTION_ID', 'WDS_ENV_ID', 'WDS_VERSION'):
         if required_env not in os.environ:
-            print 'Missing required env variable "%s"' % required_env
+            print('Missing required env variable "%s"' % required_env)
             sys.exit(-1)
 
     main()
